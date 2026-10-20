@@ -15,6 +15,9 @@
   .me b { color: #06c; }
   #peers { font: 13px ui-monospace, monospace; color: #555; margin: 0 0 8px; }
   [hidden] { display: none !important; }
+  footer { margin-top: 16px; font-size: 13px; color: #555; }
+  footer summary { cursor: pointer; }
+  #debug { font: 12px ui-monospace, monospace; max-height: 30vh; overflow-y: auto; background: #f5f5f5; padding: 8px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -35,6 +38,14 @@
   </form>
 </div>
 
+<footer>
+  <details>
+    <summary>Log</summary>
+    <pre id="debug"></pre>
+    <button id="copyLog">Log kopieren</button>
+  </details>
+</footer>
+
 <script type="module">
 import { joinRoom, selfId, createEvent, subscribe } from 'https://cdn.jsdelivr.net/npm/trystero@0.26.0/+esm'
 
@@ -53,7 +64,19 @@ const $ = id => document.getElementById(id)
 const names = {}      // peerId -> Name
 const nostrSeen = {}  // peerId -> Zeitpunkt des letzten Lebenszeichens über Nostr
 const seenIds = new Set()
+const eventIds = new Set()   // schon verarbeitete Nostr-Events
+const paths = {}      // peerId -> zuletzt geloggter Verbindungsweg
 let room, msg, hello, myName, sockets = []
+
+// Technisches Log in der aufklappbaren Fußzeile
+function dbg(text) {
+  const el = $('debug')
+  el.textContent += `${new Date().toLocaleTimeString()} ${text}\n`
+  el.scrollTop = el.scrollHeight
+}
+window.onerror = (m) => dbg(`Fehler: ${m}`)
+window.onunhandledrejection = e => dbg(`Fehler: ${e.reason}`)
+$('copyLog').onclick = () => navigator.clipboard.writeText($('debug').textContent)
 
 function log(text, cls) {
   const div = document.createElement('div')
@@ -69,9 +92,10 @@ function addPeer(id, name) {
   names[id] = String(name)
 }
 
-function receive({ id, text }, peerId) {
-  if (seenIds.has(id)) return   // kam schon über den anderen Weg
+function receive({ id, text }, peerId, via) {
+  if (seenIds.has(id)) return dbg(`Nachricht von ${names[peerId] ?? peerId} über ${via}: schon erhalten, ignoriert`)
   seenIds.add(id)
+  dbg(`Nachricht von ${names[peerId] ?? peerId} über ${via} empfangen`)
   log([names[peerId] ?? peerId, String(text)])
 }
 
@@ -96,12 +120,16 @@ function connectRelay(url) {
   const relay = {}
   const open = () => {
     relay.ws = new WebSocket(url)
-    relay.ws.onopen = () => relay.ws.send(subscribe('webchat', TOPIC))
+    relay.ws.onopen = () => { dbg(`Relay ${url} verbunden`); relay.ws.send(subscribe('webchat', TOPIC)) }
     relay.ws.onmessage = async e => {
       const [type, , event] = JSON.parse(e.data)
-      if (type === 'EVENT') try { onNostr(await decrypt(event.content)) } catch {}
+      if (type === 'EVENT') {
+        if (eventIds.has(event.id)) return   // dasselbe Event von einem weiteren Relay
+        eventIds.add(event.id)
+        try { onNostr(await decrypt(event.content)) } catch {}
+      } else if (type === 'NOTICE' || type === 'CLOSED' || (type === 'OK' && event === false)) dbg(`Relay ${url}: ${e.data}`)
     }
-    relay.ws.onclose = () => setTimeout(open, 5000)
+    relay.ws.onclose = e => { dbg(`Relay ${url} getrennt (Code ${e.code}), neuer Versuch in 5 s`); setTimeout(open, 5000) }
   }
   open()
   return relay
@@ -109,14 +137,17 @@ function connectRelay(url) {
 
 async function nostrSend(obj) {
   const event = await createEvent(TOPIC, await encrypt({ ...obj, from: selfId, name: myName }))
-  sockets.forEach(r => r.ws.readyState === 1 && r.ws.send(event))
+  const open = sockets.filter(r => r.ws.readyState === 1)
+  open.forEach(r => r.ws.send(event))
+  if (obj.t === 'msg') dbg(`Nachricht über Nostr an ${open.length} Relay(s) gesendet`)
 }
 
 function onNostr(m) {
   if (m.from === selfId) return
+  if (!nostrSeen[m.from]) dbg(`Nostr: erstes Lebenszeichen von ${m.name} (${m.from})`)
   nostrSeen[m.from] = Date.now()
   addPeer(m.from, m.name)
-  if (m.t === 'msg') receive(m, m.from)
+  if (m.t === 'msg') receive(m, m.from, 'Nostr')
 }
 
 // --- Verbindungsstatus pro Peer ---
@@ -138,14 +169,22 @@ async function pathOf(pc) {
 let myIpv6 = 'IPv6 wird geprüft…'
 fetch('https://api6.ipify.org', { signal: AbortSignal.timeout(5000) })
   .then(r => r.ok ? 'IPv6 ✓' : 'kein IPv6', () => 'kein IPv6')
-  .then(v => { myIpv6 = v; updateStatus() })
+  .then(v => { myIpv6 = v; dbg(`IPv6-Check: ${v}`); updateStatus() })
 
 async function updateStatus() {
   const rtc = room?.getPeers() ?? {}
   const alive = id => id in rtc || Date.now() - (nostrSeen[id] ?? 0) < 45000
-  for (const id in names) if (!alive(id)) { log(`${names[id]} hat den Raum verlassen`, 'sys'); delete names[id] }
-  const rows = await Promise.all(Object.keys(names).map(async id =>
-    `${names[id]}: ${id in rtc ? await pathOf(rtc[id]) : 'über Nostr-Relay'}`))
+  for (const id in names) if (!alive(id)) {
+    log(`${names[id]} hat den Raum verlassen`, 'sys')
+    dbg(`${names[id]}: seit 45 s kein Lebenszeichen, entfernt`)
+    delete names[id]; delete paths[id]
+  }
+  const rows = await Promise.all(Object.keys(names).map(async id => {
+    const path = id in rtc ? await pathOf(rtc[id]) : 'über Nostr-Relay'
+    if (paths[id] !== path) dbg(`${names[id]}: Weg ist jetzt „${path}“`)
+    paths[id] = path
+    return `${names[id]}: ${path}`
+  }))
   const relays = sockets.filter(r => r.ws.readyState === 1).length
   $('status').textContent = `Raum „${ROOM}“ · ${relays}/${RELAYS.length} Nostr-Relays · Dein Gerät: ${myIpv6}${ONLY_NOSTR ? ' · WebRTC aus (Test)' : ''}`
   $('peers').textContent = rows.join('\n') || 'Noch keine anderen Peers'
@@ -160,11 +199,12 @@ $('join').onsubmit = e => {
     msg = room.makeAction('msg')
     hello = room.makeAction('hello')
     // Neuen Peers den eigenen Namen schicken
-    room.onPeerJoin = id => hello.send(myName, { target: id })
-    room.onPeerLeave = () => updateStatus()
+    room.onPeerJoin = id => { dbg(`WebRTC: Verbindung zu ${id} steht`); hello.send(myName, { target: id }) }
+    room.onPeerLeave = id => { dbg(`WebRTC: Verbindung zu ${names[id] ?? id} getrennt`); updateStatus() }
     hello.onMessage = (name, { peerId }) => { addPeer(peerId, name); updateStatus() }
-    msg.onMessage = (m, { peerId }) => receive(m, peerId)
+    msg.onMessage = (m, { peerId }) => receive(m, peerId, 'WebRTC')
   }
+  dbg(`Beigetreten: Raum „${ROOM}“ als ${myName} (${selfId})${ONLY_NOSTR ? ', WebRTC aus' : ''}`)
 
   sockets = RELAYS.map(connectRelay)
   // Lebenszeichen über Nostr, damit wir auch Peers ohne WebRTC-Verbindung kennen
@@ -183,9 +223,9 @@ $('send').onsubmit = e => {
   e.preventDefault()
   const m = { id: crypto.randomUUID(), text: $('text').value }
   seenIds.add(m.id)
-  msg?.send(m)
-  // Über Nostr nur, wenn jemand nicht per WebRTC erreichbar ist
   const rtc = room?.getPeers() ?? {}
+  if (msg && Object.keys(rtc).length) { msg.send(m); dbg(`Nachricht per WebRTC an ${Object.keys(rtc).length} Peer(s) gesendet`) }
+  // Über Nostr nur, wenn jemand nicht per WebRTC erreichbar ist
   if (Object.keys(names).some(id => !(id in rtc))) nostrSend({ t: 'msg', ...m })
   log([myName, m.text], 'me')
   $('text').value = ''
