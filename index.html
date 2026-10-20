@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2P Chat</title>
+<style>
+  body { font: 15px system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; }
+  form { display: flex; gap: 8px; margin: 8px 0; }
+  input { flex: 1; padding: 8px; font: inherit; }
+  button { padding: 8px 14px; font: inherit; }
+  #log { height: 60vh; overflow-y: auto; border: 1px solid #ccc; padding: 8px; }
+  #log div { margin: 2px 0; }
+  .sys { color: #888; font-style: italic; }
+  .me b { color: #06c; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>P2P Chat</h1>
+
+<form id="join">
+  <input id="nick" placeholder="Dein Name" required>
+  <button>Beitreten</button>
+</form>
+
+<div id="chat" hidden>
+  <p id="status"></p>
+  <div id="log"></div>
+  <form id="send">
+    <input id="text" placeholder="Nachricht…" autocomplete="off" required>
+    <button>Senden</button>
+  </form>
+</div>
+
+<script type="module">
+import { joinRoom, selfId } from 'https://cdn.jsdelivr.net/npm/trystero@0.26.0/+esm'
+
+const ROOM = 'lobby'
+const $ = id => document.getElementById(id)
+const names = {}   // peerId -> Name
+let room, msg, hello, myName
+
+function log(text, cls) {
+  const div = document.createElement('div')
+  if (cls) div.className = cls
+  if (typeof text === 'string') div.textContent = text
+  else { const b = document.createElement('b'); b.textContent = text[0] + ': '; div.append(b, text[1]) }
+  $('log').append(div)
+  $('log').scrollTop = $('log').scrollHeight
+}
+
+function updateStatus() {
+  const peers = Object.keys(room.getPeers()).length
+  $('status').textContent = `Raum „${ROOM}“ · ${peers} Peer(s) verbunden`
+}
+
+$('join').onsubmit = e => {
+  e.preventDefault()
+  myName = $('nick').value.trim()
+  room = joinRoom({ appId: 'webchat-poc' }, ROOM)
+  msg = room.makeAction('msg')
+  hello = room.makeAction('hello')
+
+  // Neuen Peers den eigenen Namen schicken
+  room.onPeerJoin = id => { hello.send(myName, { target: id }); updateStatus() }
+  room.onPeerLeave = id => { log(`${names[id] ?? id} hat den Raum verlassen`, 'sys'); delete names[id]; updateStatus() }
+  hello.onMessage = (name, { peerId }) => { names[peerId] = String(name); log(`${names[peerId]} ist beigetreten`, 'sys') }
+  msg.onMessage = (text, { peerId }) => log([names[peerId] ?? peerId, String(text)])
+
+  $('join').hidden = true
+  $('chat').hidden = false
+  log(`Du bist „${myName}“ (${selfId}). Warte auf andere Peers…`, 'sys')
+  updateStatus()
+  $('text').focus()
+}
+
+$('send').onsubmit = e => {
+  e.preventDefault()
+  const text = $('text').value
+  msg.send(text)
+  log([myName, text], 'me')
+  $('text').value = ''
+}
+</script>
+</body>
+</html>
