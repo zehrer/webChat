@@ -13,6 +13,7 @@
   #log div { margin: 2px 0; }
   .sys { color: #888; font-style: italic; }
   .me b { color: #06c; }
+  #peers { font: 13px ui-monospace, monospace; color: #555; margin: 0 0 8px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -26,6 +27,7 @@
 
 <div id="chat" hidden>
   <p id="status"></p>
+  <pre id="peers"></pre>
   <div id="log"></div>
   <form id="send">
     <input id="text" placeholder="Nachricht…" autocomplete="off" required>
@@ -34,12 +36,24 @@
 </div>
 
 <script type="module">
-import { joinRoom, selfId } from 'https://cdn.jsdelivr.net/npm/trystero@0.26.0/+esm'
+import { joinRoom, selfId, createEvent, subscribe } from 'https://cdn.jsdelivr.net/npm/trystero@0.26.0/+esm'
 
-const ROOM = 'lobby'
+const params = new URLSearchParams(location.search)
+const ROOM = params.get('room') ?? 'lobby'
+const ONLY_NOSTR = params.has('nostr')   // Test: WebRTC aus, alles über Nostr
+// TURN-Relay für Peers, die sich nicht direkt verbinden können (z. B. Mobilfunk-NAT)
+const TURN = [
+  // { urls: ['turn:…:3478', 'turns:…:443?transport=tcp'], username: '…', credential: '…' }
+]
+// Fallback: Nachrichten über öffentliche Nostr-Relays, wenn WebRTC nicht klappt
+const RELAYS = ['wss://nos.lol', 'wss://relay.damus.io', 'wss://relay.primal.net', 'wss://nostr.mom']
+const TOPIC = `webchat-poc/${ROOM}/fallback`
+
 const $ = id => document.getElementById(id)
-const names = {}   // peerId -> Name
-let room, msg, hello, myName
+const names = {}      // peerId -> Name
+const nostrSeen = {}  // peerId -> Zeitpunkt des letzten Lebenszeichens über Nostr
+const seenIds = new Set()
+let room, msg, hello, myName, sockets = []
 
 function log(text, cls) {
   const div = document.createElement('div')
@@ -50,23 +64,113 @@ function log(text, cls) {
   $('log').scrollTop = $('log').scrollHeight
 }
 
-function updateStatus() {
-  const peers = Object.keys(room.getPeers()).length
-  $('status').textContent = `Raum „${ROOM}“ · ${peers} Peer(s) verbunden`
+function addPeer(id, name) {
+  if (!(id in names)) log(`${name} ist beigetreten`, 'sys')
+  names[id] = String(name)
+}
+
+function receive({ id, text }, peerId) {
+  if (seenIds.has(id)) return   // kam schon über den anderen Weg
+  seenIds.add(id)
+  log([names[peerId] ?? peerId, String(text)])
+}
+
+// --- Nostr: einfache verschlüsselte Nachrichten über Relays ---
+// Schlüssel aus dem Raum abgeleitet: hält Relay-Betreiber fern, ist aber kein echtes Geheimnis
+const key = crypto.subtle.digest('SHA-256', new TextEncoder().encode(TOPIC))
+  .then(h => crypto.subtle.importKey('raw', h, 'AES-GCM', false, ['encrypt', 'decrypt']))
+
+async function encrypt(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await key, new TextEncoder().encode(JSON.stringify(obj)))
+  return btoa(String.fromCharCode(...iv, ...new Uint8Array(data)))
+}
+
+async function decrypt(str) {
+  const bytes = Uint8Array.from(atob(str), c => c.charCodeAt(0))
+  const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, await key, bytes.slice(12))
+  return JSON.parse(new TextDecoder().decode(data))
+}
+
+function connectRelay(url) {
+  const relay = {}
+  const open = () => {
+    relay.ws = new WebSocket(url)
+    relay.ws.onopen = () => relay.ws.send(subscribe('webchat', TOPIC))
+    relay.ws.onmessage = async e => {
+      const [type, , event] = JSON.parse(e.data)
+      if (type === 'EVENT') try { onNostr(await decrypt(event.content)) } catch {}
+    }
+    relay.ws.onclose = () => setTimeout(open, 5000)
+  }
+  open()
+  return relay
+}
+
+async function nostrSend(obj) {
+  const event = await createEvent(TOPIC, await encrypt({ ...obj, from: selfId, name: myName }))
+  sockets.forEach(r => r.ws.readyState === 1 && r.ws.send(event))
+}
+
+function onNostr(m) {
+  if (m.from === selfId) return
+  nostrSeen[m.from] = Date.now()
+  addPeer(m.from, m.name)
+  if (m.t === 'msg') receive(m, m.from)
+}
+
+// --- Verbindungsstatus pro Peer ---
+async function pathOf(pc) {
+  const stats = [...(await pc.getStats()).values()]
+  const pair = stats.find(s => s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded')
+  const local = pair && stats.find(s => s.id === pair.localCandidateId)
+  const remote = pair && stats.find(s => s.id === pair.remoteCandidateId)
+  if (!local) return 'WebRTC'
+  if (local.candidateType === 'relay' || remote?.candidateType === 'relay') return 'WebRTC über TURN'
+  // Browser verbergen lokale Adressen oft (leer oder *.local)
+  const ip = [remote?.address, local.address].find(a => a && !a.endsWith('.local'))
+  const version = ip ? (ip.includes(':') ? ' · IPv6' : ' · IPv4') : ''
+  const viaStun = local.candidateType !== 'host' || remote?.candidateType !== 'host'
+  return `WebRTC direkt${viaStun ? ' (durch NAT per STUN)' : ''}${version}`
+}
+
+// Hat dieses Gerät IPv6 ins Internet? (api6.ipify.org ist nur per IPv6 erreichbar)
+let myIpv6 = 'IPv6 wird geprüft…'
+fetch('https://api6.ipify.org', { signal: AbortSignal.timeout(5000) })
+  .then(r => r.ok ? 'IPv6 ✓' : 'kein IPv6', () => 'kein IPv6')
+  .then(v => { myIpv6 = v; updateStatus() })
+
+async function updateStatus() {
+  const rtc = room?.getPeers() ?? {}
+  const alive = id => id in rtc || Date.now() - (nostrSeen[id] ?? 0) < 45000
+  for (const id in names) if (!alive(id)) { log(`${names[id]} hat den Raum verlassen`, 'sys'); delete names[id] }
+  const rows = await Promise.all(Object.keys(names).map(async id =>
+    `${names[id]}: ${id in rtc ? await pathOf(rtc[id]) : 'über Nostr-Relay'}`))
+  const relays = sockets.filter(r => r.ws.readyState === 1).length
+  $('status').textContent = `Raum „${ROOM}“ · ${relays}/${RELAYS.length} Nostr-Relays · Dein Gerät: ${myIpv6}${ONLY_NOSTR ? ' · WebRTC aus (Test)' : ''}`
+  $('peers').textContent = rows.join('\n') || 'Noch keine anderen Peers'
 }
 
 $('join').onsubmit = e => {
   e.preventDefault()
   myName = $('nick').value.trim()
-  room = joinRoom({ appId: 'webchat-poc' }, ROOM)
-  msg = room.makeAction('msg')
-  hello = room.makeAction('hello')
 
-  // Neuen Peers den eigenen Namen schicken
-  room.onPeerJoin = id => { hello.send(myName, { target: id }); updateStatus() }
-  room.onPeerLeave = id => { log(`${names[id] ?? id} hat den Raum verlassen`, 'sys'); delete names[id]; updateStatus() }
-  hello.onMessage = (name, { peerId }) => { names[peerId] = String(name); log(`${names[peerId]} ist beigetreten`, 'sys') }
-  msg.onMessage = (text, { peerId }) => log([names[peerId] ?? peerId, String(text)])
+  if (!ONLY_NOSTR) {
+    room = joinRoom({ appId: 'webchat-poc', ...(TURN.length && { turnConfig: TURN }) }, ROOM)
+    msg = room.makeAction('msg')
+    hello = room.makeAction('hello')
+    // Neuen Peers den eigenen Namen schicken
+    room.onPeerJoin = id => hello.send(myName, { target: id })
+    room.onPeerLeave = () => updateStatus()
+    hello.onMessage = (name, { peerId }) => { addPeer(peerId, name); updateStatus() }
+    msg.onMessage = (m, { peerId }) => receive(m, peerId)
+  }
+
+  sockets = RELAYS.map(connectRelay)
+  // Lebenszeichen über Nostr, damit wir auch Peers ohne WebRTC-Verbindung kennen
+  setInterval(() => nostrSend({ t: 'hi' }), 15000)
+  setTimeout(() => nostrSend({ t: 'hi' }), 2000)
+  setInterval(updateStatus, 3000)
 
   $('join').hidden = true
   $('chat').hidden = false
@@ -77,9 +181,13 @@ $('join').onsubmit = e => {
 
 $('send').onsubmit = e => {
   e.preventDefault()
-  const text = $('text').value
-  msg.send(text)
-  log([myName, text], 'me')
+  const m = { id: crypto.randomUUID(), text: $('text').value }
+  seenIds.add(m.id)
+  msg?.send(m)
+  // Über Nostr nur, wenn jemand nicht per WebRTC erreichbar ist
+  const rtc = room?.getPeers() ?? {}
+  if (Object.keys(names).some(id => !(id in rtc))) nostrSend({ t: 'msg', ...m })
+  log([myName, m.text], 'me')
   $('text').value = ''
 }
 </script>
